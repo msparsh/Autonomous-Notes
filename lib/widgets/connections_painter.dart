@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../models/note_node.dart';
+import '../models/note_group.dart';
 
 class ConnectionEdge {
   final String sourceId;
@@ -20,6 +21,7 @@ class ConnectionsPainter extends CustomPainter {
   final double animationValue; // 0.0 to 1.0, driven by an animation controller
   final Map<String, NoteNode> noteMap;
   final String searchQuery;
+  final List<NoteGroup> groups;
 
   ConnectionsPainter({
     required this.notes,
@@ -27,6 +29,7 @@ class ConnectionsPainter extends CustomPainter {
     required this.animationValue,
     required this.noteMap,
     required this.searchQuery,
+    required this.groups,
   });
 
   Offset _getIntersectionPoint(Rect rect, Offset target) {
@@ -69,11 +72,26 @@ class ConnectionsPainter extends CustomPainter {
 
     final String query = searchQuery.trim().toLowerCase();
 
+    // Map each note to the set of group IDs it belongs to
+    final Map<String, Set<String>> noteGroups = {};
+    for (final g in groups) {
+      for (final noteId in g.noteIds) {
+        noteGroups.putIfAbsent(noteId, () => {}).add(g.id);
+      }
+    }
+
     for (final edge in edges) {
       final source = noteMap[edge.sourceId];
       final target = noteMap[edge.targetId];
 
       if (source == null || target == null) continue;
+
+      // Group isolation: only connect if they belong to the exact same set of groups
+      final sourceGroupIds = noteGroups[edge.sourceId] ?? {};
+      final targetGroupIds = noteGroups[edge.targetId] ?? {};
+      final bool setsEqual = sourceGroupIds.length == targetGroupIds.length &&
+          sourceGroupIds.containsAll(targetGroupIds);
+      if (!setsEqual) continue;
 
       if (query.isNotEmpty) {
         final sourceMatches = source.content.toLowerCase().contains(query);
@@ -197,5 +215,6 @@ class ConnectionsPainter extends CustomPainter {
   bool shouldRepaint(covariant ConnectionsPainter oldDelegate) =>
       oldDelegate.notes != notes ||
       oldDelegate.edges != edges ||
-      oldDelegate.animationValue != animationValue;
+      oldDelegate.animationValue != animationValue ||
+      oldDelegate.groups != groups;
 }

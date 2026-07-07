@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import '../models/note_node.dart';
+import '../models/note_group.dart';
 import '../utils/vector_engine.dart';
 
 class DatabaseHelper {
@@ -27,7 +28,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       dbPath,
-      version: 6,
+      version: 7,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE notes(
@@ -62,6 +63,20 @@ class DatabaseHelper {
           CREATE TABLE vocab(
             id INTEGER PRIMARY KEY,
             word_list TEXT
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE note_groups(
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            color_index INTEGER
+          )
+        ''');
+        await db.execute('''
+          CREATE TABLE group_notes(
+            group_id TEXT,
+            note_id TEXT,
+            PRIMARY KEY (group_id, note_id)
           )
         ''');
         await _insertMockNotes(db);
@@ -129,6 +144,26 @@ class DatabaseHelper {
           } catch (_) {}
           // Re-run recalculation to populate vocab table
           await _recalculateAllEdgesWithDb(db);
+        }
+        if (oldVersion < 7) {
+          try {
+            await db.execute('''
+              CREATE TABLE IF NOT EXISTS note_groups(
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                color_index INTEGER
+              )
+            ''');
+          } catch (_) {}
+          try {
+            await db.execute('''
+              CREATE TABLE IF NOT EXISTS group_notes(
+                group_id TEXT,
+                note_id TEXT,
+                PRIMARY KEY (group_id, note_id)
+              )
+            ''');
+          } catch (_) {}
         }
       },
     );
@@ -239,6 +274,89 @@ class DatabaseHelper {
       where: 'source_id = ? OR target_id = ?',
       whereArgs: [id, id],
     );
+    // Remove node from any group associations
+    await db.delete(
+      'group_notes',
+      where: 'note_id = ?',
+      whereArgs: [id],
+    );
+  }
+
+  // --- Group Queries ---
+
+  static Future<List<NoteGroup>> getGroups() async {
+    final db = await database;
+    final List<Map<String, dynamic>> groupMaps = await db.query('note_groups');
+    final List<NoteGroup> groups = [];
+    for (final map in groupMaps) {
+      final String groupId = map['id'] as String;
+      final List<Map<String, dynamic>> noteMaps = await db.query(
+        'group_notes',
+        columns: ['note_id'],
+        where: 'group_id = ?',
+        whereArgs: [groupId],
+      );
+      final List<String> noteIds = noteMaps.map((e) => e['note_id'] as String).toList();
+      groups.add(NoteGroup(
+        id: groupId,
+        name: map['name'] as String? ?? '',
+        noteIds: noteIds,
+        colorIndex: map['color_index'] as int? ?? 0,
+      ));
+    }
+    return groups;
+  }
+
+  static Future<void> insertGroup(NoteGroup group) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.insert(
+        'note_groups',
+        {
+          'id': group.id,
+          'name': group.name,
+          'color_index': group.colorIndex,
+        },
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+      // Clean old note assignments
+      await txn.delete(
+        'group_notes',
+        where: 'group_id = ?',
+        whereArgs: [group.id],
+      );
+      // Insert new note assignments
+      for (final noteId in group.noteIds) {
+        await txn.insert(
+          'group_notes',
+          {
+            'group_id': group.id,
+            'note_id': noteId,
+          },
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+      }
+    });
+  }
+
+  static Future<void> updateGroup(NoteGroup group) async {
+    await insertGroup(group); // insert with replace handles transaction/updates perfectly
+  }
+
+  static Future<void> deleteGroup(String groupId) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      await txn.delete(
+        'note_groups',
+        where: 'id = ?',
+        whereArgs: [groupId],
+      );
+      await txn.delete(
+        'group_notes',
+        where: 'group_id = ?',
+        whereArgs: [groupId],
+      );
+    });
   }
 
   // Vector & Edges calculations helper

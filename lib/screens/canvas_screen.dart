@@ -1,5 +1,7 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_animate/flutter_animate.dart';
@@ -11,6 +13,8 @@ import '../widgets/draggable_resizable_note_card.dart';
 import '../widgets/connections_painter.dart';
 import '../widgets/app_header.dart';
 import '../widgets/bridge_beam_painter.dart';
+import '../models/note_group.dart';
+import '../widgets/groups_painter.dart';
 
 class CanvasScreen extends StatefulWidget {
   const CanvasScreen({super.key});
@@ -25,6 +29,10 @@ class _CanvasScreenState extends State<CanvasScreen>
       TransformationController();
   final List<NoteNode> _notes = [];
   final List<ConnectionEdge> _edges = [];
+  final List<NoteGroup> _groups = [];
+  bool _isGroupDrawingMode = false;
+  final List<Offset> _drawPoints = [];
+  String? _hoveredGroupId;
   final double _canvasSize = 10000.0;
   bool _isLoading = true;
   final bool _isRebuildingEdges = false;
@@ -122,6 +130,7 @@ class _CanvasScreenState extends State<CanvasScreen>
     try {
       final loadedNotes = await DatabaseHelper.getNotes();
       final loadedEdgesData = await DatabaseHelper.getEdges();
+      final loadedGroups = await DatabaseHelper.getGroups();
 
       final loadedEdges = loadedEdgesData.map((e) {
         return ConnectionEdge(
@@ -136,6 +145,8 @@ class _CanvasScreenState extends State<CanvasScreen>
         _notes.addAll(loadedNotes);
         _edges.clear();
         _edges.addAll(loadedEdges);
+        _groups.clear();
+        _groups.addAll(loadedGroups);
         _isLoading = false;
         _notesMap = {for (var n in loadedNotes) n.id: n};
       });
@@ -589,6 +600,8 @@ class _CanvasScreenState extends State<CanvasScreen>
                   boundaryMargin: const EdgeInsets.all(3000.0),
                   minScale: 0.2,
                   maxScale: 4.0,
+                  panEnabled: !_isGroupDrawingMode,
+                  scaleEnabled: !_isGroupDrawingMode,
                   onInteractionStart: (details) {
                     _viewportInteracting.value = true;
                     _previousMatrix =
@@ -616,10 +629,20 @@ class _CanvasScreenState extends State<CanvasScreen>
                     _previousMatrix =
                         _transformationController.value.clone();
                   },
-                  child: GestureDetector(
-                    onDoubleTapDown: _isBridgeModeActive
-                        ? null
-                        : (details) => _addNewNoteAt(details.localPosition),
+                  child: MouseRegion(
+                    onHover: _onCanvasHover,
+                    onExit: (_) {
+                      setState(() {
+                        _hoveredGroupId = null;
+                      });
+                    },
+                    child: GestureDetector(
+                      onDoubleTapDown: _isBridgeModeActive || _isGroupDrawingMode
+                          ? null
+                          : (details) => _addNewNoteAt(details.localPosition),
+                    onPanStart: _isGroupDrawingMode ? _onGroupDrawStart : null,
+                    onPanUpdate: _isGroupDrawingMode ? _onGroupDrawUpdate : null,
+                    onPanEnd: _isGroupDrawingMode ? (_) => _finalizeGroupDrawing() : null,
                     child: SizedBox(
                       width: _canvasSize,
                       height: _canvasSize,
@@ -631,6 +654,17 @@ class _CanvasScreenState extends State<CanvasScreen>
                         child: Stack(
                           clipBehavior: Clip.none,
                           children: [
+                            // Groups background blobs layer
+                            Positioned.fill(
+                              child: RepaintBoundary(
+                                child: CustomPaint(
+                                  painter: GroupsPainter(
+                                    groups: _sortedGroups(),
+                                    noteMap: _notesMap,
+                                  ),
+                                ),
+                              ),
+                            ),
                             // Connections layer
                             Positioned.fill(
                               child: RepaintBoundary(
@@ -645,6 +679,7 @@ class _CanvasScreenState extends State<CanvasScreen>
                                               .value,
                                       noteMap: _notesMap,
                                       searchQuery: _searchQuery,
+                                      groups: _groups,
                                     ),
                                   ),
                                 ),
@@ -702,12 +737,93 @@ class _CanvasScreenState extends State<CanvasScreen>
                                 ),
                               ),
                             ),
+                            // Drawing lasso layer (only when drawing group)
+                            if (_isGroupDrawingMode && _drawPoints.isNotEmpty)
+                              Positioned.fill(
+                                child: IgnorePointer(
+                                  child: CustomPaint(
+                                    painter: _LassoPainter(points: _drawPoints),
+                                  ),
+                                ),
+                              ),
+                            // Group headers (labels and delete buttons)
+                            ..._groups.map((group) {
+                              final pos = _groupHeaderPosition(group);
+                              if (pos == null) return const SizedBox.shrink();
+                              final color = GroupColors.colors[group.colorIndex % GroupColors.colors.length];
+                              final bool isHovered = _hoveredGroupId == group.id;
+                              return Positioned(
+                                left: pos.dx - 60, // center the 120px wide header roughly
+                                top: pos.dy,
+                                child: MouseRegion(
+                                  onEnter: (_) => setState(() => _hoveredGroupId = group.id),
+                                  onExit: (_) => setState(() => _hoveredGroupId = null),
+                                  child: AnimatedOpacity(
+                                    opacity: isHovered ? 1.0 : 0.0,
+                                    duration: const Duration(milliseconds: 180),
+                                    child: IgnorePointer(
+                                      ignoring: !isHovered,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xFF18181B).withValues(alpha: 0.92),
+                                          borderRadius: BorderRadius.circular(16),
+                                          border: Border.all(color: color.withValues(alpha: 0.4), width: 1.2),
+                                          boxShadow: [
+                                            BoxShadow(
+                                              color: Colors.black.withValues(alpha: 0.3),
+                                              blurRadius: 8,
+                                              offset: const Offset(0, 3),
+                                            ),
+                                          ],
+                                        ),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Icon(Icons.layers_outlined, size: 12, color: color),
+                                            const SizedBox(width: 5),
+                                            Text(
+                                              group.name.isEmpty ? 'Group' : group.name,
+                                              style: GoogleFonts.outfit(
+                                                fontSize: 10.5,
+                                                fontWeight: FontWeight.w600,
+                                                color: Colors.white.withValues(alpha: 0.85),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 4),
+                                            GestureDetector(
+                                              onTap: () async {
+                                                await DatabaseHelper.deleteGroup(group.id);
+                                                final loadedGroups = await DatabaseHelper.getGroups();
+                                                setState(() {
+                                                  _groups.clear();
+                                                  _groups.addAll(loadedGroups);
+                                                });
+                                              },
+                                              child: Padding(
+                                                padding: const EdgeInsets.all(2.0),
+                                                child: Icon(
+                                                  Icons.close_rounded,
+                                                  size: 11,
+                                                  color: Colors.white.withValues(alpha: 0.4),
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              );
+                            }),
                           ],
                         ),
                       ),
                     ),
                   ),
                 ),
+              ),
 
           // ── Bridge Beam Overlay (screen-space, drawn above canvas) ─────────
           if ((_isBridgeModeActive || _isBridging) && screenBeamA != null)
@@ -739,8 +855,19 @@ class _CanvasScreenState extends State<CanvasScreen>
                 ),
               ),
 
+            // ── Group Mode Top Banner ──────────────────────────────────────
+            if (_isGroupDrawingMode)
+              Positioned(
+                top: 52,
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: _buildGroupBanner(),
+                ),
+              ),
+
             // ── Bottom Command Dock ────────────────────────────────────────
-            if (!_isBridgeModeActive && !_isBridging)
+            if (!_isBridgeModeActive && !_isBridging && !_isGroupDrawingMode)
               Positioned(
                 bottom: 24,
                 left: 0,
@@ -760,7 +887,7 @@ class _CanvasScreenState extends State<CanvasScreen>
 
 
             // ── Status Toast ───────────────────────────────────────────────
-            if (_isRebuildingEdges || _isSimulatingLayout)
+            if (_isRebuildingEdges)
               Positioned(
                 top: 52,
                 left: 0,
@@ -794,9 +921,7 @@ class _CanvasScreenState extends State<CanvasScreen>
                         ),
                         const SizedBox(width: 10),
                         Text(
-                          _isRebuildingEdges
-                              ? 'Running semantic indexing…'
-                              : 'Simulating gravity…',
+                          'Running semantic indexing…',
                           style: GoogleFonts.inter(
                             fontSize: 12,
                             color:
@@ -957,6 +1082,195 @@ class _CanvasScreenState extends State<CanvasScreen>
     return cleaned.length > 18 ? '${cleaned.substring(0, 18)}…' : cleaned;
   }
 
+  void _onGroupDrawStart(DragStartDetails details) {
+    setState(() {
+      _drawPoints.clear();
+      _drawPoints.add(details.localPosition);
+    });
+  }
+
+  void _onGroupDrawUpdate(DragUpdateDetails details) {
+    setState(() {
+      _drawPoints.add(details.localPosition);
+    });
+  }
+
+  void _finalizeGroupDrawing() async {
+    if (_drawPoints.length < 3) {
+      setState(() {
+        _drawPoints.clear();
+        _isGroupDrawingMode = false;
+      });
+      return;
+    }
+
+    final List<String> enclosedNoteIds = [];
+    for (final note in _notes) {
+      final center = Offset(
+        note.position.dx + note.width / 2,
+        note.position.dy + note.height / 2,
+      );
+      if (_isPointInPolygon(center, _drawPoints)) {
+        enclosedNoteIds.add(note.id);
+      }
+    }
+
+    if (enclosedNoteIds.isNotEmpty) {
+      final Set<int> usedColors = {};
+      for (final existingGroup in _groups) {
+        final hasOverlap = existingGroup.noteIds.any((id) => enclosedNoteIds.contains(id));
+        if (hasOverlap) {
+          usedColors.add(existingGroup.colorIndex);
+        }
+      }
+      int colorIndex = 0;
+      for (int i = 0; i < 6; i++) {
+        if (!usedColors.contains(i)) {
+          colorIndex = i;
+          break;
+        }
+      }
+      final newGroup = NoteGroup(
+        id: _uuid.v4(),
+        name: 'Group ${_groups.length + 1}',
+        noteIds: enclosedNoteIds,
+        colorIndex: colorIndex,
+      );
+      await DatabaseHelper.insertGroup(newGroup);
+      final loadedGroups = await DatabaseHelper.getGroups();
+      setState(() {
+        _groups.clear();
+        _groups.addAll(loadedGroups);
+        _isGroupDrawingMode = false;
+        _drawPoints.clear();
+      });
+    } else {
+      setState(() {
+        _drawPoints.clear();
+        _isGroupDrawingMode = false;
+      });
+    }
+  }
+
+  bool _isPointInPolygon(Offset p, List<Offset> poly) {
+    bool inside = false;
+    for (int i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      if ((poly[i].dy > p.dy) != (poly[j].dy > p.dy) &&
+          p.dx < (poly[j].dx - poly[i].dx) * (p.dy - poly[i].dy) / (poly[j].dy - poly[i].dy) + poly[i].dx) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  List<NoteGroup> _sortedGroups() {
+    final sorted = List<NoteGroup>.from(_groups);
+    sorted.sort((a, b) {
+      final aNotesCount = a.noteIds.length;
+      final bNotesCount = b.noteIds.length;
+      if (aNotesCount != bNotesCount) {
+        return bNotesCount.compareTo(aNotesCount);
+      }
+      double area(NoteGroup group) {
+        if (group.noteIds.isEmpty) return 0.0;
+        double minX = double.infinity, minY = double.infinity;
+        double maxX = -double.infinity, maxY = -double.infinity;
+        for (final noteId in group.noteIds) {
+          final note = _notesMap[noteId];
+          if (note == null) continue;
+          minX = math.min(minX, note.position.dx);
+          minY = math.min(minY, note.position.dy);
+          maxX = math.max(maxX, note.position.dx + note.width);
+          maxY = math.max(maxY, note.position.dy + note.height);
+        }
+        if (minX == double.infinity) return 0.0;
+        return (maxX - minX) * (maxY - minY);
+      }
+      return area(b).compareTo(area(a));
+    });
+    return sorted;
+  }
+
+  Offset? _groupHeaderPosition(NoteGroup group) {
+    if (group.noteIds.isEmpty) return null;
+    double minX = double.infinity;
+    double maxX = -double.infinity;
+    double minY = double.infinity;
+    for (final noteId in group.noteIds) {
+      final note = _notesMap[noteId];
+      if (note == null) continue;
+      minX = math.min(minX, note.position.dx);
+      maxX = math.max(maxX, note.position.dx + note.width);
+      minY = math.min(minY, note.position.dy);
+    }
+    if (minX == double.infinity) return null;
+    return Offset((minX + maxX) / 2, minY - 30);
+  }
+
+  List<Offset> _convexHull(List<Offset> points) {
+    if (points.length <= 1) return points;
+    final sorted = List<Offset>.from(points)
+      ..sort((a, b) {
+        if (a.dx != b.dx) return a.dx.compareTo(b.dx);
+        return a.dy.compareTo(b.dy);
+      });
+    double cross(Offset o, Offset a, Offset b) {
+      return (a.dx - o.dx) * (b.dy - o.dy) - (a.dy - o.dy) * (b.dx - o.dx);
+    }
+    final lower = <Offset>[];
+    for (final p in sorted) {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower.last, p) <= 0) {
+        lower.removeLast();
+      }
+      lower.add(p);
+    }
+    final upper = <Offset>[];
+    for (final p in sorted.reversed) {
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper.last, p) <= 0) {
+        upper.removeLast();
+      }
+      upper.add(p);
+    }
+    lower.removeLast();
+    upper.removeLast();
+    return [...lower, ...upper];
+  }
+
+  void _onCanvasHover(PointerHoverEvent event) {
+    if (_isGroupDrawingMode) return;
+    final pos = event.localPosition;
+    String? foundGroupId;
+    final sorted = _sortedGroups().reversed.toList();
+    for (final group in sorted) {
+      final List<Offset> pointsToHull = [];
+      for (final noteId in group.noteIds) {
+        final note = _notesMap[noteId];
+        if (note == null) continue;
+        final rect = Rect.fromLTWH(
+          note.position.dx,
+          note.position.dy,
+          note.width,
+          note.height,
+        ).inflate(50.0);
+        pointsToHull.add(rect.topLeft);
+        pointsToHull.add(rect.topRight);
+        pointsToHull.add(rect.bottomLeft);
+        pointsToHull.add(rect.bottomRight);
+      }
+      if (pointsToHull.isEmpty) continue;
+      final hull = _convexHull(pointsToHull);
+      if (_isPointInPolygon(pos, hull)) {
+        foundGroupId = group.id;
+        break;
+      }
+    }
+    if (_hoveredGroupId != foundGroupId) {
+      setState(() {
+        _hoveredGroupId = foundGroupId;
+      });
+    }
+  }
+
   // ─── Dark command dock ────────────────────────────────────────────────────
 
   Widget _buildCommandDock() {
@@ -998,7 +1312,21 @@ class _CanvasScreenState extends State<CanvasScreen>
             tooltip: 'Thought Bridge — select two notes to synthesize a connection',
             active: _isBridgeModeActive,
             activeColor: const Color(0xFFF59E0B),
-            onTap: _isBridging ? null : _toggleBridgeMode,
+            onTap: _isBridging || _isGroupDrawingMode ? null : _toggleBridgeMode,
+          ),
+          _DockBtn(
+            icon: Icons.layers_outlined,
+            tooltip: 'Draw group — draw boundary to group nodes',
+            active: _isGroupDrawingMode,
+            activeColor: const Color(0xFF10B981),
+            onTap: _isBridging || _isBridgeModeActive
+                ? null
+                : () {
+                    setState(() {
+                      _isGroupDrawingMode = !_isGroupDrawingMode;
+                      _drawPoints.clear();
+                    });
+                  },
           ),
           _DockBtn(
             icon: Icons.hub_rounded,
@@ -1121,7 +1449,118 @@ class _CanvasScreenState extends State<CanvasScreen>
       ),
     );
   }
+
+  Widget _buildGroupBanner() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF18181B).withValues(alpha: 0.96),
+        borderRadius: BorderRadius.circular(28),
+        border: Border.all(
+          color: const Color(0xFF10B981).withValues(alpha: 0.45),
+          width: 1.0,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFF10B981).withValues(alpha: 0.25),
+            blurRadius: 24,
+            offset: const Offset(0, 4),
+          ),
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.4),
+            blurRadius: 16,
+            offset: const Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ShaderMask(
+            shaderCallback: (bounds) => const LinearGradient(
+              colors: [Color(0xFF10B981), Color(0xFF059669)],
+            ).createShader(bounds),
+            child: const Icon(
+              Icons.layers_outlined,
+              size: 18,
+              color: Colors.white,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Group Mode',
+                style: GoogleFonts.outfit(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                  color: Colors.white,
+                  letterSpacing: -0.2,
+                ),
+              ),
+              Text(
+                'Draw a line around the notes you want to group',
+                style: GoogleFonts.inter(
+                  fontSize: 10.5,
+                  color: Colors.white.withValues(alpha: 0.45),
+                  fontWeight: FontWeight.w400,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(width: 14),
+          Container(
+            width: 1,
+            height: 24,
+            color: Colors.white.withValues(alpha: 0.1),
+          ),
+          const SizedBox(width: 10),
+          _BridgeCancelBtn(onTap: () {
+            setState(() {
+              _isGroupDrawingMode = false;
+              _drawPoints.clear();
+            });
+          }),
+        ],
+      ),
+    ).animate().fadeIn(duration: 250.ms).slideY(begin: -0.2, end: 0.0);
+  }
 }
+
+class _LassoPainter extends CustomPainter {
+  final List<Offset> points;
+  _LassoPainter({required this.points});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (points.length < 2) return;
+    final paint = Paint()
+      ..color = const Color(0xFF10B981)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.0
+      ..strokeCap = StrokeCap.round;
+
+    final glowPaint = Paint()
+      ..color = const Color(0xFF10B981).withValues(alpha: 0.3)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 8.0
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4.0);
+
+    final path = Path()..moveTo(points.first.dx, points.first.dy);
+    for (int i = 1; i < points.length; i++) {
+      path.lineTo(points[i].dx, points[i].dy);
+    }
+
+    canvas.drawPath(path, glowPaint);
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _LassoPainter oldDelegate) => oldDelegate.points != points;
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // _BridgeNodeIndicator — small pill showing a selected bridge node label
