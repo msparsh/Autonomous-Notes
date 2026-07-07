@@ -489,12 +489,28 @@ class DatabaseHelper {
       );
     }
 
+    // Fetch group notes mapping to enforce group exclusivity
+    final List<Map<String, dynamic>> groupNotesRows = await db.query('group_notes');
+    final Map<String, Set<String>> noteToGroups = {};
+    for (final row in groupNotesRows) {
+      final noteId = row['note_id'] as String;
+      final groupId = row['group_id'] as String;
+      noteToGroups.putIfAbsent(noteId, () => {}).add(groupId);
+    }
+
     // 3. Double loop for similarity calculation & edge generation
     final ids = generatedVectors.keys.toList();
     for (int i = 0; i < ids.length; i++) {
       for (int j = i + 1; j < ids.length; j++) {
         final idA = ids[i];
         final idB = ids[j];
+
+        final groupsA = noteToGroups[idA] ?? {};
+        final groupsB = noteToGroups[idB] ?? {};
+        final bool canRelate = (groupsA.isEmpty && groupsB.isEmpty) ||
+            groupsA.intersection(groupsB).isNotEmpty;
+        if (!canRelate) continue;
+
         final vecA = generatedVectors[idA]!;
         final vecB = generatedVectors[idB]!;
 

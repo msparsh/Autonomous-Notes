@@ -33,6 +33,7 @@ class _CanvasScreenState extends State<CanvasScreen>
   bool _isGroupDrawingMode = false;
   final List<Offset> _drawPoints = [];
   String? _hoveredGroupId;
+  String? _draggingGroupId;
   final double _canvasSize = 10000.0;
   bool _isLoading = true;
   final bool _isRebuildingEdges = false;
@@ -351,7 +352,6 @@ class _CanvasScreenState extends State<CanvasScreen>
       _notes.addAll(freshNotes);
       _notesMap = {for (var n in freshNotes) n.id: n};
     });
-    _runSemanticGravityLayout();
   }
 
   void _addNewNoteAtCenter() {
@@ -655,16 +655,66 @@ class _CanvasScreenState extends State<CanvasScreen>
                           clipBehavior: Clip.none,
                           children: [
                             // Groups background blobs layer
-                            Positioned.fill(
-                              child: RepaintBoundary(
-                                child: CustomPaint(
-                                  painter: GroupsPainter(
-                                    groups: _sortedGroups(),
-                                    noteMap: _notesMap,
+                            ..._sortedGroups().map((group) {
+                              final List<Offset> pointsToHull = [];
+                              for (final noteId in group.noteIds) {
+                                final note = _notesMap[noteId];
+                                if (note == null) continue;
+                                final rect = Rect.fromLTWH(
+                                  note.position.dx,
+                                  note.position.dy,
+                                  note.width,
+                                  note.height,
+                                ).inflate(50.0);
+                                pointsToHull.add(rect.topLeft);
+                                pointsToHull.add(rect.topRight);
+                                pointsToHull.add(rect.bottomLeft);
+                                pointsToHull.add(rect.bottomRight);
+                              }
+                              if (pointsToHull.isEmpty) return const SizedBox.shrink();
+                              final hull = _convexHull(pointsToHull);
+                              final bool isDraggingThisGroup = _draggingGroupId == group.id;
+
+                              return Positioned.fill(
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.deferToChild,
+                                  onPanStart: (_) {
+                                    setState(() {
+                                      _draggingGroupId = group.id;
+                                    });
+                                  },
+                                  onPanUpdate: (details) {
+                                    setState(() {
+                                      for (final noteId in group.noteIds) {
+                                        final note = _notesMap[noteId];
+                                        if (note != null) {
+                                          note.position += details.delta;
+                                        }
+                                      }
+                                    });
+                                  },
+                                  onPanEnd: (_) async {
+                                    setState(() {
+                                      _draggingGroupId = null;
+                                    });
+                                    for (final noteId in group.noteIds) {
+                                      final note = _notesMap[noteId];
+                                      if (note != null) {
+                                        await DatabaseHelper.updateNotePositionAndSize(note);
+                                      }
+                                    }
+                                  },
+                                  child: CustomPaint(
+                                    size: Size(_canvasSize, _canvasSize),
+                                    painter: SingleGroupPainter(
+                                      group: group,
+                                      hull: hull,
+                                      noteMap: _notesMap,
+                                    ),
                                   ),
                                 ),
-                              ),
-                            ),
+                              );
+                            }),
                             // Connections layer
                             Positioned.fill(
                               child: RepaintBoundary(
@@ -722,6 +772,7 @@ class _CanvasScreenState extends State<CanvasScreen>
                                             for (var n in freshNotes) n.id: n
                                           };
                                         });
+                                        _runSemanticGravityLayout();
                                       },
                                       onLayoutChanged:
                                           (updatedNote) async {
@@ -752,6 +803,7 @@ class _CanvasScreenState extends State<CanvasScreen>
                               if (pos == null) return const SizedBox.shrink();
                               final color = GroupColors.colors[group.colorIndex % GroupColors.colors.length];
                               final bool isHovered = _hoveredGroupId == group.id;
+                              final bool isDraggingThisGroup = _draggingGroupId == group.id;
                               return Positioned(
                                 left: pos.dx - 60, // center the 120px wide header roughly
                                 top: pos.dy,
@@ -759,57 +811,89 @@ class _CanvasScreenState extends State<CanvasScreen>
                                   onEnter: (_) => setState(() => _hoveredGroupId = group.id),
                                   onExit: (_) => setState(() => _hoveredGroupId = null),
                                   child: AnimatedOpacity(
-                                    opacity: isHovered ? 1.0 : 0.0,
+                                    opacity: (isHovered || isDraggingThisGroup) ? 1.0 : 0.35,
                                     duration: const Duration(milliseconds: 180),
                                     child: IgnorePointer(
-                                      ignoring: !isHovered,
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                        decoration: BoxDecoration(
-                                          color: const Color(0xFF18181B).withValues(alpha: 0.92),
-                                          borderRadius: BorderRadius.circular(16),
-                                          border: Border.all(color: color.withValues(alpha: 0.4), width: 1.2),
-                                          boxShadow: [
-                                            BoxShadow(
-                                              color: Colors.black.withValues(alpha: 0.3),
-                                              blurRadius: 8,
-                                              offset: const Offset(0, 3),
-                                            ),
-                                          ],
-                                        ),
-                                        child: Row(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            Icon(Icons.layers_outlined, size: 12, color: color),
-                                            const SizedBox(width: 5),
-                                            Text(
-                                              group.name.isEmpty ? 'Group' : group.name,
-                                              style: GoogleFonts.outfit(
-                                                fontSize: 10.5,
-                                                fontWeight: FontWeight.w600,
-                                                color: Colors.white.withValues(alpha: 0.85),
+                                      ignoring: false,
+                                      child: GestureDetector(
+                                        behavior: HitTestBehavior.opaque,
+                                        onPanStart: (_) {
+                                          setState(() {
+                                            _draggingGroupId = group.id;
+                                          });
+                                        },
+                                        onPanUpdate: (details) {
+                                          setState(() {
+                                            for (final noteId in group.noteIds) {
+                                              final note = _notesMap[noteId];
+                                              if (note != null) {
+                                                note.position += details.delta;
+                                              }
+                                            }
+                                          });
+                                        },
+                                        onPanEnd: (_) async {
+                                          setState(() {
+                                            _draggingGroupId = null;
+                                          });
+                                          for (final noteId in group.noteIds) {
+                                            final note = _notesMap[noteId];
+                                            if (note != null) {
+                                              await DatabaseHelper.updateNotePositionAndSize(note);
+                                            }
+                                          }
+                                        },
+                                        child: Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                                          decoration: BoxDecoration(
+                                            color: const Color(0xFF18181B).withValues(alpha: 0.92),
+                                            borderRadius: BorderRadius.circular(16),
+                                            border: Border.all(color: color.withValues(alpha: 0.4), width: 1.2),
+                                            boxShadow: [
+                                              BoxShadow(
+                                                color: Colors.black.withValues(alpha: 0.3),
+                                                blurRadius: 8,
+                                                offset: const Offset(0, 3),
                                               ),
-                                            ),
-                                            const SizedBox(width: 4),
-                                            GestureDetector(
-                                              onTap: () async {
-                                                await DatabaseHelper.deleteGroup(group.id);
-                                                final loadedGroups = await DatabaseHelper.getGroups();
-                                                setState(() {
-                                                  _groups.clear();
-                                                  _groups.addAll(loadedGroups);
-                                                });
-                                              },
-                                              child: Padding(
-                                                padding: const EdgeInsets.all(2.0),
-                                                child: Icon(
-                                                  Icons.close_rounded,
-                                                  size: 11,
-                                                  color: Colors.white.withValues(alpha: 0.4),
+                                            ],
+                                          ),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(Icons.layers_outlined, size: 12, color: color),
+                                              const SizedBox(width: 5),
+                                              Text(
+                                                group.name.isEmpty ? 'Group' : group.name,
+                                                style: GoogleFonts.outfit(
+                                                  fontSize: 10.5,
+                                                  fontWeight: FontWeight.w600,
+                                                  color: Colors.white.withValues(alpha: 0.85),
                                                 ),
                                               ),
-                                            ),
-                                          ],
+                                              const SizedBox(width: 8),
+                                              MouseRegion(
+                                                cursor: SystemMouseCursors.click,
+                                                child: GestureDetector(
+                                                  onTap: () async {
+                                                    await DatabaseHelper.deleteGroup(group.id);
+                                                    final loadedGroups = await DatabaseHelper.getGroups();
+                                                    setState(() {
+                                                      _groups.clear();
+                                                      _groups.addAll(loadedGroups);
+                                                    });
+                                                  },
+                                                  child: Padding(
+                                                    padding: const EdgeInsets.all(2.0),
+                                                    child: Icon(
+                                                      Icons.close_rounded,
+                                                      size: 11,
+                                                      color: Colors.white.withValues(alpha: 0.4),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
                                         ),
                                       ),
                                     ),
@@ -1116,18 +1200,21 @@ class _CanvasScreenState extends State<CanvasScreen>
     }
 
     if (enclosedNoteIds.isNotEmpty) {
-      final Set<int> usedColors = {};
+      // Choose the least used color from GroupColors to minimize repetition
+      final Map<int, int> colorCounts = {};
+      for (int i = 0; i < GroupColors.colors.length; i++) {
+        colorCounts[i] = 0;
+      }
       for (final existingGroup in _groups) {
-        final hasOverlap = existingGroup.noteIds.any((id) => enclosedNoteIds.contains(id));
-        if (hasOverlap) {
-          usedColors.add(existingGroup.colorIndex);
-        }
+        final idx = existingGroup.colorIndex % GroupColors.colors.length;
+        colorCounts[idx] = (colorCounts[idx] ?? 0) + 1;
       }
       int colorIndex = 0;
-      for (int i = 0; i < 6; i++) {
-        if (!usedColors.contains(i)) {
+      int minCount = 999999;
+      for (int i = 0; i < GroupColors.colors.length; i++) {
+        if (colorCounts[i]! < minCount) {
+          minCount = colorCounts[i]!;
           colorIndex = i;
-          break;
         }
       }
       final newGroup = NoteGroup(
